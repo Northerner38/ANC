@@ -1,0 +1,542 @@
+/* USER CODE BEGIN Header */
+/**
+ ******************************************************************************
+ * @file           : main.c
+ * @brief          : ANC-Ready Audio System - Ultra Low Latency
+ * @author         : Bertan Kuzeyli
+ * @note           : Optimized for Active Noise Cancellation applications
+ ******************************************************************************
+ */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "usb_device.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <string.h>
+#include "usbd_cdc_if.h"
+#include "arm_math.h"
+#include <math.h>
+/* USER CODE END Includes */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* ============================================================================
+ * ANC SİSTEM PARAMETRELERİ
+ * ============================================================================
+ * ANC için kritik: Toplam gecikme = Sample Period + İşlem Süresi
+ * 
+ * NUM_SAMPLES = 4  → ~83µs  (12,000 kesme/sn) - EN HIZLI
+ * NUM_SAMPLES = 8  → ~167µs (6,000 kesme/sn)  - ÖNERİLEN
+ * NUM_SAMPLES = 16 → ~333µs (3,000 kesme/sn)  - Hala iyi
+ * 
+ * ANC'de 1ms'nin altında kalmalısın! (500Hz için λ/4 < 17cm)
+ */
+#define NUM_SAMPLES             8   // ANC için optimal: 167µs gecikme
+#define I2S_BUFFER_SIZE         (NUM_SAMPLES * 2 * 2) // 8*2*2=32
+#define BLOCK_SIZE              NUM_SAMPLES
+
+/* Protokol */
+#define SOF_WORD                0x55AA
+#define EOF_BYTE                0x0A
+
+/* DSP Sabitleri */
+#define INV_MAX_24BIT           1.1920928955078125e-7f // 1.0 / 2^23
+#define SCALE_24BIT             8388608.0f             // 2^23
+
+/* ANC Parametreleri */
+#define ANC_ENABLED             1   // 0: Bypass, 1: ANC Aktif
+#define ANC_MAX_GAIN            2.0f    // Güvenli maksimum (6dB)
+#define ANC_PHASE_INVERT        1   // 0: Normal, 1: 180° faz kaydırma
+
+/* DC ve Normalizasyon */
+#define DC_ALPHA                0.9995f // Daha agresif DC temizliği
+#define TARGET_PEAK             0.85f   // Clipping için güvenlik marjı
+#define MAX_GAIN                4.0f    // 12dB max (önceki 20dB tehlikeliydi)
+#define MIN_SIGNAL              0.0005f // Gürültü eşiği
+
+/* USER CODE END PD */
+
+/* Private variables ---------------------------------------------------------*/
+I2S_HandleTypeDef hi2s1;
+I2S_HandleTypeDef hi2s3;
+DMA_HandleTypeDef hdma_spi1_rx;
+DMA_HandleTypeDef hdma_spi3_tx;
+
+/* USER CODE BEGIN PV */
+
+/* ============================================================================
+ * BELLEK DÜZENİ - DMA ve Cache Uyumlu
+ * ============================================================================ */
+
+// 1. MİKROFON TAMPONU (Referans Mikrofon - Feedback ANC için)
+int32_t i2s_rx_buffer[I2S_BUFFER_SIZE] __attribute__((aligned(32)));
+
+// 2. DAC TAMPONU (Anti-Noise Sinyali Çıkışı)
+int32_t i2s_tx_buffer[I2S_BUFFER_SIZE] __attribute__((aligned(32)));
+
+// 3. İŞARETÇİ (Hangi yarı işleniyor?)
+volatile int32_t* volatile active_rx_buffer = NULL;
+
+// 4. USB Paketi
+typedef struct __attribute__((packed)) {
+    uint16_t sof;
+    float samples[NUM_SAMPLES];
+    uint8_t eof;
+} usb_packet_t;
+usb_packet_t usb_packet __attribute__((aligned(4)));
+
+/* ============================================================================
+ * DSP TAMPONLARI
+ * ============================================================================ */
+float32_t input_buffer[BLOCK_SIZE] __attribute__((aligned(4)));
+float32_t output_buffer[BLOCK_SIZE] __attribute__((aligned(4)));
+float32_t temp_buffer[BLOCK_SIZE] __attribute__((aligned(4)));
+
+/* ANC İçin Ek Tamponlar */
+float32_t anc_filtered[BLOCK_SIZE] __attribute__((aligned(4)));
+float32_t anc_delayed[BLOCK_SIZE] __attribute__((aligned(4)));
+
+/* ============================================================================
+ * ANC FİLTRE KATSAYILARI (Placeholder - Geliştirilecek)
+ * ============================================================================
+ * FxLMS algoritması için gerekli:
+ * - Adaptif filtre katsayıları (W[n])
+ * - Sekonder yol modeli (S[n])
+ * - Hata sinyali tamponu
+ */
+#define ANC_FILTER_TAPS         32  // FIR filtre boyutu
+float32_t anc_coeffs[ANC_FILTER_TAPS] = {0};  // Adaptif katsayılar
+float32_t anc_state[BLOCK_SIZE + ANC_FILTER_TAPS - 1] = {0};
+arm_fir_instance_f32 anc_filter;
+
+/* Sekonder Yol Modeli (Secondary Path - akustik feedback) */
+float32_t secondary_path_coeffs[ANC_FILTER_TAPS] = {0}; 
+float32_t secondary_path_state[BLOCK_SIZE + ANC_FILTER_TAPS - 1] = {0};
+arm_fir_instance_f32 secondary_path_filter;
+
+/* ============================================================================
+ * DSP PARAMETRELERI
+ * ============================================================================ */
+float32_t dc_offset = 0.0f;
+
+/* Performans İzleme */
+volatile uint32_t process_time_us = 0;
+volatile uint32_t max_process_time_us = 0;
+volatile uint32_t overrun_count = 0;
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MPU_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_I2S1_Init(void);
+static void MX_I2S3_Init(void);
+
+/* USER CODE BEGIN PFP */
+void audio_init(void);
+void anc_init(void);
+void i2s_to_float(int32_t* i2s_data, float32_t* float_data, uint32_t num_samples);
+void float_to_i2s_stereo(float32_t* float_data, int32_t* i2s_data, uint32_t num_samples);
+void remove_dc_offset(float32_t* data, uint32_t num_samples);
+void normalize_audio(float32_t* input, float32_t* output, uint32_t num_samples);
+void anc_process_feedforward(float32_t* ref_mic, float32_t* output, uint32_t num_samples);
+void send_usb_packet(float32_t* data, uint32_t num_samples);
+void process_audio_block(void);
+inline uint32_t get_microseconds(void);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/**
+ * @brief  Sistem ve ANC başlatma
+ */
+void audio_init(void)
+{
+    dc_offset = 0.0f;
+    max_process_time_us = 0;
+    overrun_count = 0;
+}
+
+void anc_init(void)
+{
+    /* FIR filtre başlatma */
+    arm_fir_init_f32(&anc_filter, ANC_FILTER_TAPS, anc_coeffs, anc_state, BLOCK_SIZE);
+    arm_fir_init_f32(&secondary_path_filter, ANC_FILTER_TAPS, 
+                     secondary_path_coeffs, secondary_path_state, BLOCK_SIZE);
+    
+    /* Başlangıç katsayıları - Basit low-pass (geliştirilebilir) */
+    for (uint32_t i = 0; i < ANC_FILTER_TAPS; i++)
+    {
+        // Hamming penceresi ile basit LPF (1kHz kesim @48kHz)
+        float32_t w = 0.54f - 0.46f * arm_cos_f32(2.0f * PI * i / (ANC_FILTER_TAPS - 1));
+        anc_coeffs[i] = w * 0.05f; // Düşük başlangıç kazancı
+    }
+    
+    /* Sekonder yol modeli - başlangıçta birim gecikme */
+    secondary_path_coeffs[1] = 1.0f;
+}
+
+/**
+ * @brief  Mikrosaniye zamanlayıcı (DWT kullanarak)
+ */
+inline uint32_t get_microseconds(void)
+{
+    return DWT->CYCCNT / (SystemCoreClock / 1000000);
+}
+
+/**
+ * @brief  I2S Ham → Float (Sol Kanal)
+ */
+__attribute__((optimize("O3")))
+void i2s_to_float(int32_t* i2s_data, float32_t* float_data, uint32_t num_samples)
+{
+    for (uint32_t i = 0; i < num_samples; i++)
+    {
+        int32_t raw = i2s_data[i * 2] >> 8; // Sol kanal + hizalama
+        float_data[i] = (float32_t)raw * INV_MAX_24BIT;
+    }
+}
+
+/**
+ * @brief  Float → I2S Stereo (DAC için)
+ * @note   Soft clipping eklendi - distortion önleme
+ */
+__attribute__((optimize("O3")))
+void float_to_i2s_stereo(float32_t* float_data, int32_t* i2s_data, uint32_t num_samples)
+{
+    for (uint32_t i = 0; i < num_samples; i++)
+    {
+        // Soft clipping [-0.95, 0.95]
+        float32_t clamped = fmaxf(-0.95f, fminf(0.95f, float_data[i]));
+        
+        int32_t val = (int32_t)(clamped * SCALE_24BIT);
+        int32_t formatted_sample = val << 8; // I2S hizalama
+        
+        // Mono → Stereo
+        i2s_data[i * 2]     = formatted_sample;
+        i2s_data[i * 2 + 1] = formatted_sample;
+    }
+}
+
+/**
+ * @brief  DC Offset Temizleme (IIR High-Pass)
+ * @note   ANC için kritik - DC komponenti faz kaymasına neden olur
+ */
+__attribute__((optimize("O3")))
+void remove_dc_offset(float32_t* data, uint32_t num_samples)
+{
+    float32_t block_mean;
+    arm_mean_f32(data, num_samples, &block_mean);
+    dc_offset = DC_ALPHA * dc_offset + (1.0f - DC_ALPHA) * block_mean;
+    arm_offset_f32(data, -dc_offset, data, num_samples);
+}
+
+/**
+ * @brief  Ses Seviyesi Normalizasyonu
+ * @note   ANC'de opsiyonel - genelde bypass edilir
+ */
+__attribute__((optimize("O3")))
+void normalize_audio(float32_t* input, float32_t* output, uint32_t num_samples)
+{
+    float32_t max_abs;
+    uint32_t max_index;
+    
+    arm_abs_f32(input, temp_buffer, num_samples);
+    arm_max_f32(temp_buffer, num_samples, &max_abs, &max_index);
+    
+    float32_t gain = 1.0f;
+    if (max_abs > MIN_SIGNAL)
+    {
+        gain = fminf(TARGET_PEAK / max_abs, MAX_GAIN);
+    }
+    
+    arm_scale_f32(input, gain, output, num_samples);
+}
+
+/**
+ * @brief  ANC İşleme - Feedforward Yapı
+ * @param  ref_mic: Referans mikrofon sinyali (gürültü kaynağına yakın)
+ * @param  output: Anti-noise sinyali
+ * @note   Geliştirilecek: FxLMS adaptif algoritma eklenecek
+ * 
+ * ÖNEMLİ: Bu fonksiyon şu anda basit bir placeholder!
+ * Gerçek ANC için:
+ * 1. FxLMS/LMS adaptif algoritma
+ * 2. Sekonder yol modelleme (S^)
+ * 3. Hata mikrofonu feedback
+ * 4. Kausal olmayan filtreleme (lookahead)
+ */
+__attribute__((optimize("O3")))
+void anc_process_feedforward(float32_t* ref_mic, float32_t* output, uint32_t num_samples)
+{
+#if ANC_ENABLED
+    
+    /* ADIM 1: Adaptif FIR Filtreleme */
+    arm_fir_f32(&anc_filter, ref_mic, anc_filtered, num_samples);
+    
+    /* ADIM 2: Faz Evirme (180°) - Destructive Interference */
+#if ANC_PHASE_INVERT
+    arm_negate_f32(anc_filtered, output, num_samples);
+#else
+    memcpy(output, anc_filtered, num_samples * sizeof(float32_t));
+#endif
+    
+    /* ADIM 3: Kazanç Sınırlama (Güvenlik) */
+    for (uint32_t i = 0; i < num_samples; i++)
+    {
+        if (fabsf(output[i]) > ANC_MAX_GAIN)
+        {
+            output[i] = (output[i] > 0) ? ANC_MAX_GAIN : -ANC_MAX_GAIN;
+        }
+    }
+    
+    /* TODO: FxLMS Adaptasyon Adımı
+     * 
+     * Şu anki haliyle sadece statik filtre uygulanıyor.
+     * Gerçek ANC için gerekli:
+     * 
+     * 1. Hata mikrofonu okuma (error_mic = gürültü + anti_noise)
+     * 2. Sekonder yol filtreleme: x'[n] = S^ * ref_mic[n]
+     * 3. Katsayı güncelleme: W[n+1] = W[n] + μ * e[n] * x'[n]
+     * 
+     * Örnek kod (eklenmeli):
+     * 
+     * float32_t error_signal[BLOCK_SIZE];
+     * float32_t filtered_ref[BLOCK_SIZE];
+     * 
+     * // Hata hesaplama (başka bir mikrofon gerekli)
+     * error_signal = error_mic - (ambient_noise + anti_noise_output);
+     * 
+     * // Sekonder yol filtreleme
+     * arm_fir_f32(&secondary_path_filter, ref_mic, filtered_ref, num_samples);
+     * 
+     * // LMS güncelleme
+     * float32_t mu = 0.001f; // Öğrenme hızı
+     * for (int i = 0; i < ANC_FILTER_TAPS; i++) {
+     *     anc_coeffs[i] += mu * error_signal[n] * filtered_ref[n-i];
+     * }
+     */
+    
+#else
+    /* ANC Bypass - Pass-through */
+    memcpy(output, ref_mic, num_samples * sizeof(float32_t));
+#endif
+}
+
+/**
+ * @brief  USB Telemetri Gönderimi (Debug için)
+ */
+__attribute__((optimize("O3")))
+void send_usb_packet(float32_t* data, uint32_t num_samples)
+{
+    usb_packet.sof = SOF_WORD;
+    for (uint32_t i = 0; i < num_samples; i++)
+    {
+        usb_packet.samples[i] = data[i];
+    }
+    usb_packet.eof = EOF_BYTE;
+    CDC_Transmit_HS((uint8_t*)&usb_packet, sizeof(usb_packet));
+}
+
+/**
+ * @brief  ANA İŞLEME HATTI - ANC Pipeline
+ * 
+ * ÖNEMLİ: Bu fonksiyon DMA yarım/tam kesmelerde çağrılıyor
+ * Gecikme bütçesi: < 100µs (NUM_SAMPLES=8 için)
+ */
+__attribute__((optimize("O3")))
+void process_audio_block(void)
+{
+    uint32_t start_time = get_microseconds();
+    
+    /* Overrun Kontrolü */
+    if (active_rx_buffer == NULL)
+    {
+        return; // Önceki işlem bitmemiş - OVERRUN!
+    }
+    
+    /* Buffer Adresleri */
+    int32_t* i2s_source = (int32_t*)active_rx_buffer;
+    int32_t* i2s_dest = (active_rx_buffer == i2s_rx_buffer) ?
+                         i2s_tx_buffer :
+                         &i2s_tx_buffer[I2S_BUFFER_SIZE / 2];
+    
+    /* ========================================================================
+     * ANC İŞLEME HATTI
+     * ======================================================================== */
+    
+    /* ADIM 1: I2S → Float (Referans Mikrofon) */
+    i2s_to_float(i2s_source, input_buffer, NUM_SAMPLES);
+    
+    /* ADIM 2: DC Temizleme (ZORUNLU - Faz bozulması önleme) */
+    remove_dc_offset(input_buffer, NUM_SAMPLES);
+    
+    /* ADIM 3: ANC Algoritması (Ana İşlem) */
+    anc_process_feedforward(input_buffer, output_buffer, NUM_SAMPLES);
+    
+    /* ADIM 4: Float → I2S (Anti-Noise Sinyali) */
+    float_to_i2s_stereo(output_buffer, i2s_dest, NUM_SAMPLES);
+    
+    /* ADIM 5: USB Telemetri (Opsiyonel - Debug) */
+    // send_usb_packet(output_buffer, NUM_SAMPLES);
+    
+    /* ========================================================================
+     * PERFORMANS İZLEME
+     * ======================================================================== */
+    uint32_t end_time = get_microseconds();
+    process_time_us = end_time - start_time;
+    
+    if (process_time_us > max_process_time_us)
+    {
+        max_process_time_us = process_time_us;
+    }
+    
+    /* Gecikme Uyarısı (167µs için 8 sample @ 48kHz) */
+    if (process_time_us > (NUM_SAMPLES * 1000000UL / 48000UL))
+    {
+        overrun_count++;
+        // LED ya da log ile uyarı verilebilir
+    }
+    
+    active_rx_buffer = NULL; // İşlem tamamlandı
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  Ana döngü
+  */
+int main(void)
+{
+    /* MPU Configuration */
+    MPU_Config();
+    
+    /* HAL Init */
+    HAL_Init();
+    
+    /* System Clock Config */
+    SystemClock_Config();
+    
+    /* Peripheral Init */
+    MX_GPIO_Init();
+    MX_DMA_Init();
+    MX_I2S1_Init();
+    MX_USB_DEVICE_Init();
+    MX_I2S3_Init();
+    
+    /* USER CODE BEGIN 2 */
+    
+    /* DWT Cycle Counter Aktifleştir (Timing için) */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    
+    /* Audio & ANC Init */
+    audio_init();
+    anc_init();
+    
+    /* I2S RX Başlat (Mikrofon) */
+    if (HAL_I2S_Receive_DMA(&hi2s1, (uint16_t*)i2s_rx_buffer, I2S_BUFFER_SIZE) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    
+    /* I2S TX Başlat (DAC/Hoparlör) */
+    memset(i2s_tx_buffer, 0, sizeof(i2s_tx_buffer));
+    if (HAL_I2S_Transmit_DMA(&hi2s3, (uint16_t*)i2s_tx_buffer, I2S_BUFFER_SIZE) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    
+    /* USER CODE END 2 */
+    
+    /* LED Init */
+    BSP_LED_Init(LED_GREEN);
+    BSP_LED_Init(LED_YELLOW);
+    BSP_LED_Init(LED_RED);
+    BSP_PB_Init(BUTTON_USER, BUTTON_MODE_EXTI);
+    
+    /* COM Init */
+    BspCOMInit.BaudRate = 115200;
+    BspCOMInit.WordLength = COM_WORDLENGTH_8B;
+    BspCOMInit.StopBits = COM_STOPBITS_1;
+    BspCOMInit.Parity = COM_PARITY_NONE;
+    BspCOMInit.HwFlowCtl = COM_HWCONTROL_NONE;
+    if (BSP_COM_Init(COM1, &BspCOMInit) != BSP_ERROR_NONE)
+    {
+        Error_Handler();
+    }
+    
+    /* Infinite loop */
+    while (1)
+    {
+        /* ANC İşleme (DMA callback'den tetikleniyor) */
+        if (active_rx_buffer != NULL)
+        {
+            process_audio_block();
+        }
+        
+        /* Opsiyonel: Periyodik telemetri */
+        // HAL_Delay(1000);
+        // printf("Max Process Time: %lu us, Overruns: %lu\n", 
+        //        max_process_time_us, overrun_count);
+    }
+}
+
+/* USER CODE BEGIN 4 */
+
+/**
+ * @brief  DMA RX Yarım Kesme (İlk 4/8 sample hazır)
+ */
+void HAL_I2S_RxHalfCpltCallback(I2S_HandleTypeDef *hi2s)
+{
+    if (hi2s->Instance == SPI1)
+    {
+        if (active_rx_buffer == NULL)
+        {
+            active_rx_buffer = i2s_rx_buffer; // İlk yarı
+        }
+        else
+        {
+            overrun_count++; // Önceki işlem bitmemiş!
+        }
+    }
+}
+
+/**
+ * @brief  DMA RX Tam Kesme (İkinci 4/8 sample hazır)
+ */
+void HAL_I2S_RxCpltCallback(I2S_HandleTypeDef *hi2s)
+{
+    if (hi2s->Instance == SPI1)
+    {
+        if (active_rx_buffer == NULL)
+        {
+            active_rx_buffer = &i2s_rx_buffer[I2S_BUFFER_SIZE / 2]; // İkinci yarı
+        }
+        else
+        {
+            overrun_count++;
+        }
+    }
+}
+
+/* USER CODE END 4 */
+
+/* Diğer fonksiyonlar (SystemClock_Config, MX_I2S_Init vb.) aynı kalıyor */
+// [SystemClock_Config ve diğer init fonksiyonları burada - değişiklik yok]
+
+void SystemClock_Config(void) { /* Önceki kodunuz */ }
+static void MX_I2S1_Init(void) { /* Önceki kodunuz */ }
+static void MX_I2S3_Init(void) { /* Önceki kodunuz */ }
+static void MX_DMA_Init(void) { /* Önceki kodunuz */ }
+static void MX_GPIO_Init(void) { /* Önceki kodunuz */ }
+void MPU_Config(void) { /* Önceki kodunuz */ }
+void Error_Handler(void) { while(1); }
